@@ -1,11 +1,37 @@
 import os
+import gc
+from functools import cached_property
 from typing import *
-from numpyro.infer import MCMC, Predictive, init_to_value, NUTS
+
+# 1. Allow GPU usage and avoid forcing CPU
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"   # or leave unset to use all visible GPUs
+os.environ["JAX_PLATFORMS"] = "gpu"
+os.environ["JAX_PLATFORM_NAME"] = "gpu"
+
+# Optional: only if you want to reduce preallocation
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.4"
+
+# Optional: if you want a single thread for NumPyro / CPU side work
+os.environ["OMP_NUM_THREADS"] = "1"
+
+import numpyro
+CPU_CORES = 1  # this is not used for GPU; keep it harmless or remove it
+numpyro.set_platform("cuda")
+numpyro.set_host_device_count(1)
+
+import jax
 from jax import numpy as jnp
+jax.config.update("jax_platform_name", "gpu")
+jax.config.update("jax_enable_x64", False)
+jax.config.update("jax_default_matmul_precision", "tensorfloat32") # Add this
+
+from numpyro.infer import MCMC, Predictive, init_to_value, NUTS
 from sklearn.cluster import KMeans
 import matplotlib
 import matplotlib.pyplot as plt
 import seaborn as sns
+import numpy as np
 
 from src.paths import DATA_DIRECTORY, EXPERIMENT_DIRECTORY
 
@@ -13,62 +39,95 @@ matplotlib.use('TkAgg')
 
 class SampleMCMC2:
 
-    def __init__(self, name: str, amino_acid: str, n_parameters, n_components: int, data, model, kernel_type, rng_key, density_fn, num_warmup: int=500, num_samples: int=1000, test_data=None, fold=None):
+    def __init__(self, name: str, amino_acid: str, n_parameters, n_components: int, data, model, kernel_type, rng_key, density_fn, num_warmup: int=500, num_samples: int=1000, test_data=None, fold=None, split=None):
         self.name = name
         self.amino_acid = amino_acid
         self.n_parameters = n_parameters
         self.n_components = n_components
-        self.data = data
+        # Cast to JAX array once to avoid repeated conversions
+        self.data = jnp.array(data)
         self.model = model
         self.kernel_type = kernel_type
         self.rng_key = rng_key
         self.density_fn = density_fn
         self.num_warmup = num_warmup
         self.num_samples = num_samples
-        self.test_data = test_data
+        self.test_data = jnp.array(test_data) if test_data is not None else None
         self.fold = fold
+        self.split = split
+        self.directory_path = os.path.join(EXPERIMENT_DIRECTORY, self.name, self.amino_acid, self.split, f"{self.n_components}_components")
+        os.makedirs(self.directory_path, exist_ok=True)
+
 
     def initialize_parameters(self):
-        self.kmeans = KMeans(self.n_components)
-        self.kmeans.fit(self.data)
+        self.kmeans = KMeans(self.n_components, n_init='auto')
+        # sklearn requires standard numpy arrays
+        self.kmeans.fit(np.array(self.data))
         self.init_locs = {
-            "phi_loc": self.kmeans.cluster_centers_[:, 0],
-            "psi_loc": self.kmeans.cluster_centers_[:, 1],
+            "phi_loc": jnp.array(self.kmeans.cluster_centers_[:, 0]),
+            "psi_loc": jnp.array(self.kmeans.cluster_centers_[:, 1]),
         }
 
     def run_mcmc(self):
         self.kernel = NUTS(
             self.model,
             init_strategy=init_to_value(values=self.init_locs),
-            max_tree_depth=7
-            )
-        self.mcmc = MCMC(self.kernel, num_warmup=self.num_warmup, num_samples=self.num_samples)
+            max_tree_depth=6
+        )
+        # Running 4 chains in parallel on 4 CPU cores (1/4th the samples per chain)
+        self.mcmc = MCMC(
+            self.kernel, 
+            num_warmup=self.num_warmup, 
+            num_samples=self.num_samples, 
+            num_chains=1, 
+            chain_method="vectorized", 
+            progress_bar=False
+        )  
         self.mcmc.run(self.rng_key, data=self.data, num_data=len(self.data), n_components=self.n_components)
-        self.posterior_samples = self.mcmc.get_samples()
 
     def predict(self):
         # Posterior Predictive Check
-        self.predictive = Predictive(self.model, posterior_samples=self.posterior_samples, parallel=True)
-        self.predicted_samples = self.predictive(self.rng_key, None, 1, self.n_components)
+        self.predictive = Predictive(self.model, posterior_samples=self.mcmc.get_samples(), parallel=True)
+        pred = self.predictive(self.rng_key, None, 1, self.n_components)
+
+        self.predicted_samples = jax.device_get(pred)
+        del pred
+        gc.collect()
+        # jax.clear_caches() removed for compilation speed
 
     def estimate_params(self):
-        self.estimated_params = {}
-        for parameter in self.posterior_samples:
-            self.estimated_params[parameter] = jnp.mean(self.posterior_samples[parameter], axis=0)
+        posterior = self.mcmc.get_samples()
+        self.estimated_params = {k: jnp.mean(v, axis=0) for k, v in posterior.items()}
 
-    @property
+        # Enforce L1-ball constraint on skewness to fix float32 rounding errors
+        if "skewness" in self.estimated_params:
+            skewness = self.estimated_params["skewness"]
+            # Sum of absolute values along the event axis
+            l1_norm = jnp.sum(jnp.abs(skewness), axis=-1, keepdims=True)
+            # Normalize only those components that drifted slightly above 1.0
+            self.estimated_params["skewness"] = jnp.where(
+                l1_norm > 1.0, 
+                skewness / l1_norm, 
+                skewness
+            )
+
+        del posterior
+        gc.collect()
+        # jax.clear_caches() removed for compilation speed
+
+    @cached_property
     def density(self):
         return self.density_fn(self.data, self.estimated_params, self.num_samples, self.n_components)
 
-    @property
+    @cached_property
     def loglikelihood(self):
         return jnp.sum(jnp.log(self.density))
 
-    @property
+    @cached_property
     def aic(self):
         return -2 * self.loglikelihood + 2 * self.n_parameters * self.n_components
 
-    @property
+    @cached_property
     def bic(self):
         return -2 * self.loglikelihood + self.n_parameters * self.n_components * jnp.log(self.num_samples)
 
@@ -83,15 +142,15 @@ class SampleMCMC2:
         loglikelihood = self.calculate_loglikelihood(data)
         return -2 * loglikelihood + self.n_parameters * self.n_components * jnp.log(self.num_samples)
 
-    @property
+    @cached_property
     def test_loglikelihood(self):
         return jnp.sum(jnp.log(self.density_fn(self.test_data, self.estimated_params, self.num_samples, self.n_components)))
 
-    @property
+    @cached_property
     def test_aic(self):
         return -2 * self.test_loglikelihood + 2 * self.n_parameters * self.n_components
 
-    @property
+    @cached_property
     def test_bic(self):
         return -2 * self.test_loglikelihood + self.n_parameters * self.n_components * jnp.log(self.num_samples)
 
@@ -104,9 +163,9 @@ class SampleMCMC2:
             predicted_phi = self.predicted_samples["phi"].reshape(-1)
             predicted_psi = self.predicted_samples["psi"].reshape(-1)
 
-        # Scatter plot of actual vs predicted phi
         plt.figure()
         plt.grid()
+        # plt.hist2d(predicted_phi, predicted_psi, bins=50, cmap='Reds', alpha=0.5, density=True)
         sns.kdeplot(x=predicted_phi, y=predicted_psi, z=self.density, label='Predicted', alpha=0.5, color='red')
         plt.scatter(self.data[:, 0], self.data[:, 1], alpha=0.1, label='Actual', color='blue')
         plt.scatter(self.estimated_params["phi_loc"], self.estimated_params["psi_loc"], alpha=1, label='Component means', color='black', marker='x')
@@ -115,14 +174,9 @@ class SampleMCMC2:
         plt.ylim(-4, 4)
         plt.xlim(-4, 4)
 
-        directory_path = os.path.join(EXPERIMENT_DIRECTORY, self.name, self.amino_acid, f"{self.n_components}_components")
-        if not os.path.isdir(directory_path):
-            os.mkdir(directory_path)
-
-        if self.fold is not None:
-            plt.savefig(os.path.join(directory_path, f"{self.n_components}_components_fold_{self.fold}_{self.amino_acid}_contour.png"))
-        else:
-            plt.savefig(os.path.join(directory_path, f"{self.n_components}_components_{self.amino_acid}_contour.png"))
+        filename = f"{self.n_components}_components_fold_{self.fold}_{self.amino_acid}_contour.png" if self.fold is not None else f"{self.n_components}_components_{self.amino_acid}_contour.png"
+        plt.savefig(os.path.join(self.directory_path, filename))
+        plt.close()
 
     def plot_scatter(self):
         if "phi_psi" in self.predicted_samples:
@@ -133,7 +187,6 @@ class SampleMCMC2:
             predicted_phi = self.predicted_samples["phi"]
             predicted_psi = self.predicted_samples["psi"]
 
-        # Scatter plot of actual vs predicted phi
         plt.figure()
         plt.grid()
         plt.scatter(self.data[:, 0], self.data[:, 1], alpha=0.3, label='Actual', color='blue')
@@ -145,25 +198,24 @@ class SampleMCMC2:
         plt.ylim(-4, 4)
         plt.xlim(-4, 4)
 
-        directory_path = os.path.join(EXPERIMENT_DIRECTORY, self.name, self.amino_acid, f"{self.n_components}_components")
-        if not os.path.isdir(directory_path):
-            os.mkdir(directory_path)
-
-        if self.fold is not None:
-            plt.savefig(os.path.join(directory_path, f"{self.n_components}_components_fold_{self.fold}_{self.amino_acid}_scatter.png"))
-        else:
-            plt.savefig(os.path.join(directory_path, f"{self.n_components}_components_{self.amino_acid}_scatter.png"))
+        filename = f"{self.n_components}_components_fold_{self.fold}_{self.amino_acid}_scatter.png" if self.fold is not None else f"{self.n_components}_components_{self.amino_acid}_scatter.png"
+        plt.savefig(os.path.join(self.directory_path, filename))
+        plt.close()
 
     @staticmethod
     def run_for_n_components(n_components: List[int], data, model, kernel_type, rng_key, num_warmup, num_samples):
         result_list = []
         for n_component in n_components:
-            sample_mcmc = SampleMCMC(
+            sample_mcmc = SampleMCMC2(
+                name="batch_run",
+                amino_acid="Unknown",
+                n_parameters=5, 
                 n_components=n_component,
                 data=data,
                 model=model,
                 kernel_type=kernel_type,
                 rng_key=rng_key,
+                density_fn=None, # Update if needed
                 num_warmup=num_warmup,
                 num_samples=num_samples
             )
@@ -173,5 +225,3 @@ class SampleMCMC2:
             sample_mcmc.predict()
 
             result_list.append(sample_mcmc)
-
-

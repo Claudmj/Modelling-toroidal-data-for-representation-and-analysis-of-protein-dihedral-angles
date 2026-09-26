@@ -1,9 +1,6 @@
 import numpyro.distributions as dist
 from jax import numpy as jnp
 
-from src.distributions.cosine_bivariate_von_mises_final import CosineBivariateVonMises
-from src.distributions.cosine_dist_np import CosineBivariateVonMisesNP
-
 
 class BivariateVonMisesUtils:
     @staticmethod
@@ -45,7 +42,12 @@ class BivariateVonMisesUtils:
                                                            psi_concentration=estimated_params["psi_conc"][component],
                                                            weighted_correlation=estimated_params["corr_scale"][component])
 
-            component_distribution = dist.SineSkewed(sine, estimated_params["skewness"][component])
+            skewness = estimated_params["skewness"][component]
+
+            # Fix floating point drift by normalizing if the sum of absolute values > 1
+            l1_norm = jnp.sum(jnp.abs(skewness))
+            skewness_safe = jnp.where(l1_norm > 1.0, skewness / l1_norm, skewness)
+            component_distribution = dist.SineSkewed(sine, skewness_safe)
             log_prob = component_distribution.log_prob(data)
             arr_clean = jnp.nan_to_num(log_prob, nan=-jnp.inf)
             density += weight * jnp.exp(arr_clean)
