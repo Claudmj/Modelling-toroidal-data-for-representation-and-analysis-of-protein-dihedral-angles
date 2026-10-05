@@ -5,11 +5,6 @@ from jax import numpy as jnp
 from numpyro.distributions.transforms import L1BallTransform
 from numpyro.infer.reparam import CircularReparam
 
-from src.distributions.product_von_mises import ProductVonMises, ProductVonMises2, ProductVonMises3
-# from src.distributions.cosine_von_mises import CosineBivariateVonMises
-from src.distributions.cm_test import CosineTest
-# from src.experiments.experiment1_deprecated.cosine_bivariate_von_mises import correlation
-
 
 class BivariateVonMisesModels:
     @staticmethod

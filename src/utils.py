@@ -1,8 +1,6 @@
 import json
 import numpy as np
 
-from src.sample_mcmc2 import SampleMCMC2
-
 class Utils:
     @staticmethod
     def load_entries(file_name: str):
@@ -59,7 +57,7 @@ class Utils:
         return result_dict
 
     @staticmethod
-    def add_to_fold_result_dict(result_dict, sample_mcmc: SampleMCMC2, time_difference):
+    def add_to_fold_result_dict(result_dict, sample_mcmc, time_difference):
         result_dict['ll'].append(sample_mcmc.loglikelihood)
         result_dict['aic'].append(sample_mcmc.aic)
         result_dict['bic'].append(sample_mcmc.bic)
